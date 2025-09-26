@@ -1,0 +1,329 @@
+import os
+import sys
+import wmi
+import ctypes
+import subprocess
+from collections import defaultdict
+import time
+import shutil
+from tqdm import tqdm 
+
+# --- 常量声明 ---
+TARGET_USB_MOUNT_POINT = "Z:\\" # U 盘最终挂载点
+
+# --- 检查并获取管理员权限 ---
+def is_admin():
+    """检查脚本是否以管理员身份运行。"""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+def run_as_admin(command):
+    """尝试以管理员身份重新启动脚本。"""
+    try:
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, __file__, None, 1)
+    except Exception as e:
+        print(f"无法以管理员身份重新启动脚本: {e}")
+        sys.exit(1)
+
+# --- 全局进度条复制函数 (Tqdm) ---
+def tqdm_copy_recursive(src_dir, dst_dir):
+    """
+    递归复制文件，并使用 tqdm 实现基于总字节数的全局进度条。
+    """
+    total_size = 0
+    # 第一步：递归遍历，预先计算所有文件的总字节数
+    print("  -> 正在预计算文件总大小，请稍候...")
+    for dirpath, dirnames, filenames in os.walk(src_dir):
+        for f in filenames:
+            src_file = os.path.join(dirpath, f)
+            try:
+                if not os.path.islink(src_file):
+                    total_size += os.path.getsize(src_file)
+            except Exception:
+                pass
+
+    # 第二步：使用 tqdm 包装整个复制过程
+    print("  -> 开始复制文件...")
+    with tqdm(total=total_size, unit='B', unit_scale=True, desc="📀 制作进度") as pbar:
+        for dirpath, dirnames, filenames in os.walk(src_dir):
+            relative_path = os.path.relpath(dirpath, src_dir)
+            dest_dir = os.path.join(dst_dir, relative_path)
+            
+            os.makedirs(dest_dir, exist_ok=True)
+
+            for filename in filenames:
+                src_file = os.path.join(dirpath, filename)
+                dest_file = os.path.join(dest_dir, filename)
+                
+                # 检查文件是否需要复制
+                try:
+                    if os.path.exists(dest_file) and os.path.getsize(src_file) == os.path.getsize(dest_file):
+                        pbar.update(os.path.getsize(src_file))
+                        continue
+                except Exception:
+                    pass
+                        
+                # 逐块复制文件并更新进度条
+                try:
+                    with open(src_file, 'rb') as fsrc, open(dest_file, 'wb') as fdst:
+                        chunk_size = 65536  # 64KB
+                        while True:
+                            chunk = fsrc.read(chunk_size)
+                            if not chunk:
+                                break
+                            fdst.write(chunk)
+                            pbar.update(len(chunk))
+                    
+                    shutil.copystat(src_file, dest_file)
+                except Exception as e:
+                    pbar.write(f"\n[❌ 错误] 文件复制失败: {os.path.basename(src_file)} -> {e}")
+                    try:
+                        pbar.update(os.path.getsize(src_file))
+                    except Exception:
+                        pass
+                    pass 
+    print("  -> 文件复制操作完成。")
+
+
+# --- 获取外部磁盘的函数 (已优化RAID排除逻辑) ---
+def get_external_disks():
+    """通过 WMI 筛选出所有外接的物理磁盘，并排除内部磁盘。"""
+    external_disks = []
+    try:
+        c = wmi.WMI()
+    except wmi.x_wmi:
+        print("无法连接到WMI服务。请检查脚本是否以管理员身份运行。")
+        return []
+
+    # 常见内部接口和可能混淆RAID的接口
+    internal_interfaces = ["SATA", "IDE", "NVME", "SCSI"] 
+    
+    for disk in c.Win32_DiskDrive():
+        is_external = False
+        
+        # 1. 明确的 USB 接口直接通过
+        if disk.InterfaceType and disk.InterfaceType.upper() == "USB":
+            is_external = True
+        
+        # 2. 检查 PNP ID (VEN/VID)
+        elif "VEN" in disk.PNPDeviceID.upper() or "VID" in disk.PNPDeviceID.upper():
+            # 排除已知的内部总线类型，应对 RAID/SCSI 伪装
+            if disk.InterfaceType and disk.InterfaceType.upper() in internal_interfaces:
+                 continue
+            # 否则，认为是外部设备
+            is_external = True
+        
+        if not is_external:
+            continue
+
+        disk_info = {
+            "model": disk.Model,
+            "size": int(disk.Size) if disk.Size else 0,
+            "partitions": [],
+            "device_id": disk.DeviceID # \\.\PHYSICALDRIVEx
+        }
+        for partition in disk.associators("Win32_DiskDriveToDiskPartition"):
+            for logical_disk in partition.associators("Win32_LogicalDiskToPartition"):
+                if logical_disk.DriveType == 3: # 确保是本地磁盘
+                    disk_info["partitions"].append({
+                        "device_id": logical_disk.DeviceID, # 盘符 (如 C:)
+                        "volume_name": logical_disk.VolumeName,
+                        "file_system": logical_disk.FileSystem,
+                        "size": int(logical_disk.Size) if logical_disk.Size else 0
+                    })
+        external_disks.append(disk_info)
+    return external_disks
+
+
+# --- ISO 盘符获取函数 ---
+def get_iso_drive_letter(iso_path):
+    """通过查找常见的 ISO 特征（例如 'sources' 文件夹），来确定已挂载 ISO 文件的盘符。"""
+    print("正在尝试通过文件内容定位ISO盘符...")
+    for letter in 'DEFGHJIKLMNOPQRSTUVWXYZ':
+        drive = f'{letter}:\\'
+        
+        # 避免与主驱动器冲突
+        if drive.upper() == os.environ.get("HOMEDRIVE", "").upper():
+            continue
+            
+        if os.path.exists(drive):
+            if os.path.isdir(os.path.join(drive, 'sources')):
+                print(f"成功定位到ISO盘符: {drive}")
+                return drive
+    
+    print("未能通过文件内容定位到ISO盘符。")
+    return None
+
+# --- DiskPart 自动化函数 ---
+def make_usb_bootable(disk_index, iso_path, boot_mode="UEFI"):
+    """使用 DiskPart 创建可启动U盘并复制文件。"""
+    
+    iso_drive = None
+    script_path = os.path.join(os.environ['TEMP'], 'diskpart_script.txt')
+    success = False # 跟踪是否成功
+
+    # 挂载ISO文件到虚拟驱动器
+    try:
+        print(f"正在挂载ISO文件: {iso_path}")
+        subprocess.run(['powershell', 'Mount-DiskImage', '-ImagePath', iso_path], check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        print("ISO 挂载成功。")
+    except subprocess.CalledProcessError as e:
+        print(f"[错误] PowerShell 挂载ISO失败: {e}")
+        return False
+        
+    # 保证在退出前尝试卸载ISO
+    try:
+        # 获取ISO的挂载点
+        time.sleep(3) # 等待系统分配盘符
+        iso_drive = get_iso_drive_letter()
+        if not iso_drive:
+            print("无法找到挂载的ISO文件盘符。")
+            return False
+
+        # 1. 写入 DiskPart 脚本
+        with open(script_path, 'w') as f:
+            f.write(f'select disk {disk_index}\n')
+            f.write('clean\n')
+            
+            if boot_mode == "UEFI":
+                f.write('convert gpt\n')
+                f.write('create partition primary\n')
+                f.write('format fs=fat32 quick\n')
+            else: # LEGACY
+                f.write('convert mbr\n') # Legacy 必须是 MBR
+                f.write('create partition primary\n')
+                f.write('select partition 1\n')
+                f.write('active\n') # 标记为活动分区
+                f.write('format fs=ntfs quick\n') # Legacy 通常用 NTFS (兼容大文件)
+            
+            f.write(f'assign letter={TARGET_USB_MOUNT_POINT[0]}\n')
+            f.write('exit\n')
+
+        print("正在执行 DiskPart 命令，请稍候...")
+        
+        # 2. 执行 DiskPart 脚本
+        try:
+            subprocess.run(['diskpart', '/s', script_path], check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            print("DiskPart 脚本执行成功。")
+        except subprocess.CalledProcessError as e:
+            print(f"DiskPart 脚本执行失败: {e}")
+            return False
+        
+        # 3. 关键等待：让系统识别新的 Z: 盘符
+        time.sleep(10) 
+
+        # 4. 文件复制
+        if not os.path.exists(TARGET_USB_MOUNT_POINT):
+            print("目标盘符 Z:\\ 尚未出现，等待 5 秒...")
+            time.sleep(5) 
+            if not os.path.exists(TARGET_USB_MOUNT_POINT):
+                 print("目标盘符仍未出现，复制失败。")
+                 return False
+
+        os.makedirs(TARGET_USB_MOUNT_POINT, exist_ok=True)
+        print(f"开始从 {iso_drive} 复制文件到 {TARGET_USB_MOUNT_POINT}...")
+        tqdm_copy_recursive(iso_drive, TARGET_USB_MOUNT_POINT)
+        print("\n文件复制完成。")
+
+        # 5. LEGACY 模式的引导修复 (新增的关键步骤)
+        if boot_mode != "UEFI":
+            bootsect_path = os.path.join(TARGET_USB_MOUNT_POINT, 'boot', 'bootsect.exe')
+            
+            if os.path.exists(bootsect_path):
+                print("正在写入 Legacy BIOS 引导扇区 (VBR) 和 MBR 兼容代码...")
+                try:
+                    # 运行 bootsect.exe /nt60 Z:，确保 Legacy 启动
+                    subprocess.run([bootsect_path, '/nt60', TARGET_USB_MOUNT_POINT[0] + ':'], check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                    print("Legacy 引导扇区写入成功。")
+                except subprocess.CalledProcessError as e:
+                    print(f"[致命错误] 写入 Legacy 引导扇区失败: {e}")
+                    # 如果这步失败，则整个函数返回失败
+                    return False
+            else:
+                 print("[警告] 未找到 bootsect.exe (路径Z:\\boot\\bootsect.exe)，Legacy 启动可能失败。")
+
+        success = True
+        return True
+    
+    except Exception as e:
+        print(f"文件复制失败: {e}")
+        return False
+        
+    finally:
+        # 清理步骤：卸载 ISO 并删除临时脚本
+        if iso_drive:
+            try:
+                print("正在卸载 ISO 文件...")
+                subprocess.run(['powershell', 'Dismount-DiskImage', '-ImagePath', iso_path, '-Confirm:$false'], creationflags=subprocess.CREATE_NO_WINDOW)
+                print("ISO 卸载成功。")
+            except:
+                 print("[警告] 卸载 ISO 文件失败，请手动卸载。")
+        if os.path.exists(script_path):
+            os.remove(script_path)
+
+
+# --- 主程序 ---
+def main():
+    # 1. 权限检查
+    if not is_admin():
+        print("脚本正在以普通用户权限运行，将尝试重新启动为管理员。")
+        run_as_admin(sys.argv)
+        return
+
+    # 2. 获取输入
+    print("--- Windows 启动 U 盘制作工具 (挂载模式) ---")
+    iso_path = input("请输入ISO文件的完整路径：").strip('"')
+    if not os.path.exists(iso_path):
+        print("文件不存在，请检查路径。")
+        sys.exit(1)
+
+    # 3. 磁盘选择
+    disks = get_external_disks()
+    if not disks:
+        print("未找到任何外接磁盘。")
+        sys.exit(1)
+
+    print("\n--- 外部磁盘列表 ---")
+    for i, disk in enumerate(disks):
+        size_gb = disk['size'] / (1024**3)
+        print(f"[{i}] {disk['model']} ({size_gb:.2f} GB)")
+
+    # 4. 用户输入与确认
+    try:
+        choice = int(input("请输入数字选择磁盘："))
+        if 0 <= choice < len(disks):
+            selected_drive = disks[choice]
+            disk_index = int(selected_drive['device_id'].split('\\')[-1].replace('PHYSICALDRIVE', ''))
+            
+            boot_mode = input("请选择启动模式 (输入 'UEFI' 或 'LEGACY'，默认UEFI): ").upper()
+            if boot_mode not in ["UEFI", "LEGACY"]:
+                 boot_mode = "UEFI" 
+            
+            print(f"\n警告：此操作将彻底清除磁盘 {selected_drive['model']} 的所有数据并制作 {boot_mode} 启动盘！")
+            
+            confirm = input("请再次确认，输入 'YES' 继续：")
+            if confirm.upper() == 'YES':
+                # 5. 执行制作启动盘
+                if make_usb_bootable(disk_index, iso_path, boot_mode):
+                    print("\n========== 成功 ==========")
+                    print(f"启动U盘制作完成。请从BIOS/UEFI中选择 {boot_mode} 模式启动。")
+                    print("==========================")
+                else:
+                    print("\n========== 失败 ==========")
+                    print("启动U盘制作失败。请根据上面的错误信息进行检查。")
+                    print("==========================")
+            else:
+                print("操作已取消。")
+        else:
+            print("无效的选择。")
+    except ValueError:
+        print("请输入一个有效的数字。")
+    except Exception as e:
+        print(f"发生致命错误: {e}")
+
+    input("\n**操作完成。请按 Enter 键退出窗口...**")
+
+if __name__ == "__main__":
+    main()
